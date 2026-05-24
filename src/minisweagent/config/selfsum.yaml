@@ -9,7 +9,7 @@ agent:
   # Must be used via SelfSummarizingAgent; the run scripts that hand this
   # config to DefaultAgent will silently ignore the extra keys.
   mode: selfsum
-  token_budget: 80000
+  token_budget: 4096
   min_preserve_head: 2
   min_preserve_tail: 4
   min_fold_size: 6
