@@ -1,18 +1,16 @@
-# Cursor-style self-summarization.
+# Cursor-style flat self-summarization (CompactingAgent).
 #
 # Usage:
-#   mini --config-file src/minisweagent/config/selfsum.yaml
+#   mini --agent-class compacting -c compact
 #
 # Inherits the default system/instance/observation templates — only the
 # compaction knobs and the summary prompts are new.
 agent:
-  # Must be used via SelfSummarizingAgent; the run scripts that hand this
-  # config to DefaultAgent will silently ignore the extra keys.
-  mode: selfsum
+  agent_class: compacting
   token_budget: 20000
   min_preserve_head: 2
   min_preserve_tail: 4
-  min_fold_size: 6
+  min_compact_size: 6
   tokenizer_name: cl100k_base
 
   summary_max_tokens: 2048

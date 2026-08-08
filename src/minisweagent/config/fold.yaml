@@ -1,0 +1,109 @@
+# Context-folding (FoldAgent / FoldGRPO-style, FoldingAgent). Matches the
+# mechanism in https://github.com/bytedance/FoldAgent: the model emits
+#   <function=branch description="..." prompt="...">
+# to spawn a scoped sub-agent, which in turn emits
+#   <function=return message="...">
+# to hand a concise outcome summary back to its parent. Branch internals
+# never leak into the parent's context.
+#
+# Usage:
+#   mini --agent-class folding -c fold
+agent:
+  agent_class: folding
+  max_branches: 5
+  max_branch_turns: 64
+  branch_session_timeout_s: 5400  # 90 min, FoldAgent default
+
+  system_template: |
+    You are a helpful assistant that can interact with a computer.
+
+    You have access to bash (one command per turn, enclosed in
+    ```mswea_bash_command ... ```) and to the following structured functions:
+
+    <function=branch>
+    <parameter=description>SHORT 3-5 word identifier (e.g. "Reproduce bug", "Test creation")</parameter>
+    <parameter=prompt>Clear, compact sub-task description with objectives and critical info to preserve</parameter>
+    </function>
+
+    Use `branch` to delegate a scoped sub-task to a sub-agent. The sub-agent
+    inherits your current context and works in isolation; when it returns,
+    you receive only its summary message — its internal tool calls, scratch
+    work, and observations are hidden from you. Use branching to keep your
+    active context small for long tasks.
+
+    Inside a branch, use:
+
+    <function=return>
+    <parameter=message>Your comprehensive outcome message to MAIN</parameter>
+    </function>
+
+    to hand control back. While inside a branch, you cannot branch further
+    and cannot finish the overall task — only MAIN can submit.
+
+    Normal bash command format:
+    ```mswea_bash_command
+    your_command_here
+    ```
+
+    Submit the overall task with:
+    ```mswea_bash_command
+    echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT
+    ```
+  instance_template: |
+    Please solve this issue: {{task}}
+
+    ## Recommended Workflow
+    1. Analyze the codebase by finding and reading relevant files
+    2. Create a script to reproduce the issue
+    3. Edit the source code to resolve the issue
+    4. Verify your fix works by running your script again
+    5. Test edge cases
+    6. Submit by issuing: `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
+
+    Use <function=branch> to delegate scoped sub-tasks (e.g. "reproduce the
+    bug", "run the failing tests"). The branch's internals will not clutter
+    your main context — only its return message will.
+
+    <system_information>
+    {{system}} {{release}} {{version}} {{machine}}
+    </system_information>
+
+  # Branch handshake prompts inherit the defaults from FoldingConfig;
+  # override here to customize.
+
+  step_limit: 0
+  cost_limit: 0.
+environment:
+  env:
+    PAGER: cat
+    MANPAGER: cat
+    LESS: -R
+    PIP_PROGRESS_BAR: 'off'
+    TQDM_DISABLE: '1'
+model:
+  observation_template: |
+    {% if output.exception_info -%}
+    <exception>{{output.exception_info}}</exception>
+    {% endif -%}
+    <returncode>{{output.returncode}}</returncode>
+    {% if output.output | length < 10000 -%}
+    <output>
+    {{ output.output -}}
+    </output>
+    {%- else -%}
+    <warning>
+    The output of your last command was too long.
+    </warning>
+    {%- set elided_chars = output.output | length - 10000 -%}
+    <output_head>
+    {{ output.output[:5000] }}
+    </output_head>
+    <elided_chars>
+    {{ elided_chars }} characters elided
+    </elided_chars>
+    <output_tail>
+    {{ output.output[-5000:] }}
+    </output_tail>
+    {%- endif -%}
+  model_kwargs:
+    drop_params: true

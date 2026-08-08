@@ -8,7 +8,8 @@ from minisweagent import Agent, Environment, Model
 _AGENT_MAPPING = {
     "default": "minisweagent.agents.default.DefaultAgent",
     "interactive": "minisweagent.agents.interactive.InteractiveAgent",
-    "self_summarizing": "minisweagent.agents.self_summarizing.SelfSummarizingAgent",
+    "compacting": "minisweagent.agents.compacting.CompactingAgent",
+    "folding": "minisweagent.agents.folding.FoldingAgent",
 }
 
 
