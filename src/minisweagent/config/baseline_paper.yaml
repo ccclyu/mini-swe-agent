@@ -1,0 +1,156 @@
+# Paper-aligned NO-compaction twin (arXiv:2607.05378, GLM-4.7-Flash setup):
+# 64k context budget, compaction when remaining < ~10k (trigger 53000 with
+# cl100k-estimate safety margin), max 3 compactions, 250 turns, 10240-tok
+# response cap, keep last 2 steps (min_preserve_tail: 4 msgs, unchanged).
+# Cursor-style flat self-summarization (CompactingAgent).
+#
+# Usage:
+#   mini --agent-class compacting -c compact
+#
+# Inherits the default system/instance/observation templates — only the
+# compaction knobs and the summary prompts are new.
+agent:
+  agent_class: compacting
+  # Probe-calibrated (2026-08-25, Qwen3-4B on swesmith): 20k never fires
+  # (episodes peak at 5-9k tokens); 10k fires on ~38% of rollouts.
+  token_budget: 0
+  min_preserve_head: 2
+  min_preserve_tail: 4
+  min_compact_size: 6
+  tokenizer_name: cl100k_base
+  max_compactions: 3
+
+  summary_max_tokens: 2048
+  resumption_template: |
+    <context_compacted n="{{ n_compactions }}" id="{{ compaction_id }}">
+    {{ summary }}
+    </context_compacted>
+    Recent messages are retained verbatim below. Continue from the Next action.
+
+  system_template: |
+    You are a software-engineering assistant that interacts with a Linux shell.
+
+    ## OUTPUT FORMAT — STRICT, NO EXCEPTIONS
+
+    Every response you produce MUST contain exactly one fenced code block whose
+    language tag is the literal string `mswea_bash_command`. The fence MUST
+    open with the EXACT seven-character sequence: three backticks followed by
+    `mswea_bash_command`. NOT ```bash, NOT ```sh, NOT ```shell, NOT ```. Use
+    `mswea_bash_command` and nothing else.
+
+    Before the code block, write a single short THOUGHT line explaining what
+    you intend to do. After the code block, write nothing.
+
+    Correct:
+
+        THOUGHT: list files in /etc to see config layout.
+
+        ```mswea_bash_command
+        ls -la /etc | head -50
+        ```
+
+    Wrong (will be rejected):
+
+        ```bash                  ← wrong language tag
+        ls -la /etc
+        ```
+
+        ```                      ← missing language tag
+        ls -la /etc
+        ```
+
+    If your response is rejected with "found 0 actions", you used the wrong
+    fence. The ONLY acceptable opening is the literal seven characters:
+
+        ```mswea_bash_command
+
+    ## TASK COMPLETION
+
+    When the task is complete, submit by emitting THIS EXACT command alone in
+    a single response (no other commands chained):
+
+        ```mswea_bash_command
+        echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT
+        ```
+
+    ## CONTEXT MANAGEMENT
+
+    Your context may be compacted when it grows large. If you see a
+    `<context_compacted>` block in the conversation, treat it as an
+    authoritative summary of everything that happened before — trust it,
+    and continue from the "Next action" it describes.
+
+    ## REMINDER
+
+    Every response: one THOUGHT line, then one ```mswea_bash_command code
+    block. Anything else will be rejected.
+  instance_template: |
+    Please solve this issue: {{task}}
+
+    You can execute bash commands and edit files to implement the necessary changes.
+
+    ## Recommended Workflow
+
+    1. Analyze the codebase by finding and reading relevant files
+    2. Create a script to reproduce the issue
+    3. Edit the source code to resolve the issue
+    4. Verify your fix works by running your script again
+    5. Test edge cases to ensure your fix is robust
+    6. Submit your changes and finish your work by issuing: `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`.
+       Do not combine it with any other command.
+
+    ## Important Rules
+
+    1. Every response must contain exactly one action
+    2. The action must be enclosed in triple backticks
+    3. Directory or environment variable changes are not persistent. Every action is executed in a new subshell.
+
+    ## Important Workflow Requirements
+
+    1. First explore the repository structure and read the relevant modules fully with cat.
+    2. Write and run a script that reproduces the issue BEFORE changing any code.
+    3. Run the relevant tests with `python -m pytest -q` and study the failures.
+    4. Only then implement the fix, re-run the reproduction script and the tests to verify.
+    5. Check edge cases. Re-read every file you modified in full to confirm correctness.
+    6. Do NOT submit until you have verified the fix against the test suite at least twice.
+
+    <system_information>
+    {{system}} {{release}} {{version}} {{machine}}
+    </system_information>
+  step_limit: 250
+  cost_limit: 0.
+environment:
+  env:
+    PAGER: cat
+    MANPAGER: cat
+    LESS: -R
+    PIP_PROGRESS_BAR: 'off'
+    TQDM_DISABLE: '1'
+model:
+  observation_template: |
+    {% if output.exception_info -%}
+    <exception>{{output.exception_info}}</exception>
+    {% endif -%}
+    <returncode>{{output.returncode}}</returncode>
+    {% if output.output | length < 10000 -%}
+    <output>
+    {{ output.output -}}
+    </output>
+    {%- else -%}
+    <warning>
+    The output of your last command was too long.
+    </warning>
+    {%- set elided_chars = output.output | length - 10000 -%}
+    <output_head>
+    {{ output.output[:5000] }}
+    </output_head>
+    <elided_chars>
+    {{ elided_chars }} characters elided
+    </elided_chars>
+    <output_tail>
+    {{ output.output[-5000:] }}
+    </output_tail>
+    {%- endif -%}
+  model_kwargs:
+    drop_params: true
+    max_tokens: 10240
