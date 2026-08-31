@@ -1,3 +1,6 @@
+# Inline-summarization variant of compact.yaml: the summary is elicited as an
+# appended turn of the live conversation (1+N training rows instead of 1+2N,
+# KV-cache-friendly). See CompactingConfig.summary_mode.
 # Cursor-style flat self-summarization (CompactingAgent).
 #
 # Usage:

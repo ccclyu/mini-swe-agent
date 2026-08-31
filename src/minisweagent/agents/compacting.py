@@ -1,4 +1,12 @@
-"""Compacting agent — Cursor-style flat self-summarization.
+"""Compacting agent — Cursor-style flat self-summarization (inline mode).
+
+The summary is elicited INLINE: an elicitation prompt is appended to the live
+conversation and the model writes the handoff summary as its natural next turn
+(raw transport, action parser bypassed). The interior slice is then replaced by
+the summary; the elicitation exchange is preserved in ``compactions[].summary_
+exchange`` only. At training time the summary call is a prefix-extension of its
+segment, so an N-compaction episode yields 1+N rows.
+
 
 When the estimated token count of ``self.messages`` crosses ``token_budget``
 (checked before every query), the agent synthesizes a summary of the interior
@@ -44,14 +52,24 @@ class CompactingConfig(AgentConfig):
     """Skip compaction unless the compactable slice has at least this many messages."""
     min_compact_tokens: int = 1024
     """Skip compaction unless the compactable slice has at least this many tokens."""
+    max_compactions: int = 0
+    """Maximum compactions per rollout (0 = unlimited). After the cap, the
+    context grows unbounded until the serving window rejects it — matching
+    arXiv:2607.05378's 'at most three compaction operations per rollout'."""
 
     # --- summary call ---------------------------------------------------
-    summary_system_template: str = (
-        "You are preparing to hand off this task to your future self.\n"
-        "Write a condensed brief under {{ summary_max_tokens }} tokens."
-    )
-    summary_user_template: str = "Produce the handoff summary now."
     summary_max_tokens: int = 2048
+    summary_inline_template: str = (
+        "Your context is about to be compacted: every message between the task "
+        "statement and the {{ min_preserve_tail }} most recent messages will be "
+        "REPLACED by the summary you write now. The recent messages are retained "
+        "verbatim, so focus on what is about to be lost. Write a condensed "
+        "handoff brief under {{ summary_max_tokens }} tokens using this structure:\n"
+        "## Goal\n## Plan (checked / remaining)\n## Files touched\n"
+        "## Last error / state\n## Next action\n"
+        "Preserve verbatim: file paths, exact symbol names, failing test IDs, "
+        "assertion messages. Do NOT emit a bash command block this turn."
+    )
     resumption_template: str = (
         "<context_compacted n=\"{{ n_compactions }}\">\n{{ summary }}\n"
         "</context_compacted>"
@@ -84,6 +102,8 @@ class CompactingAgent(DefaultAgent):
             should_compact = True
         if not should_compact:
             return
+        if self.config.max_compactions and len(self.compactions) >= self.config.max_compactions:
+            return
         lo = self.config.min_preserve_head
         hi = len(self.messages) - self.config.min_preserve_tail
         if hi - lo < self.config.min_compact_size:
@@ -99,7 +119,7 @@ class CompactingAgent(DefaultAgent):
         slice_msgs = list(self.messages[lo:hi])
         replaced_tokens = self._count_tokens(slice_msgs)
 
-        summary, summary_call_info = self._run_summary_call(slice_msgs)
+        summary, summary_call_info, summary_exchange = self._run_summary_call_inline(slice_msgs)
 
         compaction_id = f"c{len(self.compactions) + 1}"
         resumption = self._render_extra(
@@ -123,42 +143,34 @@ class CompactingAgent(DefaultAgent):
             "summary_message_index": lo,
             "summary_call": summary_call_info,
             "summary_token_count": self._count_tokens([replacement_msg]),
+            "summary_exchange": summary_exchange,
         })
         self.logger.info(
             "compacted [%d, %d): %d -> %d tokens",
             lo, hi, replaced_tokens, self.compactions[-1]["summary_token_count"],
         )
 
-    def _run_summary_call(self, slice_msgs: list[dict]) -> tuple[str, dict]:
-        """Ask the model for a summary over ``slice_msgs``.
+    def _run_summary_call_inline(self, slice_msgs: list[dict] | None = None) -> tuple[str, dict, list[dict]]:
+        """Elicit the summary as an appended turn of the LIVE conversation.
 
-        Bypasses the model's action parser: the summary response is free-form
-        text, so running it through the bash/tool-call parser would raise
-        FormatError on every valid summary. We call ``model._query`` directly
-        (raw litellm call) and extract the content ourselves.
+        ``self.messages`` is never mutated with the elicitation: the prompt list
+        is built ad hoc, so the agent loop never sees a parseless assistant
+        turn and the FormatError-retry path cannot fire on the free-form
+        summary. The raw ``_query`` transport bypasses the action parser
+        (same trick as the derived path); at the HTTP layer the call is a
+        prefix-extension of the running segment, which is what makes the
+        trained row structure 1+N instead of 1+2N.
         """
         from minisweagent.models.utils.content_string import get_content_string
 
-        sys_text = self._render_extra(self.config.summary_system_template)
-        user_text = self._render_extra(self.config.summary_user_template)
-        slice_text = "\n\n".join(
-            f"[{m.get('role') or m.get('type', 'unknown')}]\n{get_content_string(m)}"
-            for m in slice_msgs
+        elicit = self.model.format_message(
+            role="user",
+            content=self._render_extra(self.config.summary_inline_template),
+            extra={"source": "summary_elicitation"},
         )
-        derived = [
-            self.model.format_message(role="system", content=sys_text),
-            self.model.format_message(
-                role="user",
-                content=f"<conversation_to_summarize>\n{slice_text}\n</conversation_to_summarize>\n\n{user_text}",
-            ),
-        ]
+        derived = self.messages + [elicit]
         self.n_calls += 1
 
-        # Preferred path: most LitellmModel subclasses expose ``_query`` which
-        # returns the raw litellm response. When available we grab that so the
-        # action parser never runs. Fallback: swallow FormatError from the
-        # regular ``query`` so the summary's parse-failure doesn't kill the
-        # compaction.
         summary_text = ""
         cost = 0.0
         timestamp = None
@@ -166,21 +178,23 @@ class CompactingAgent(DefaultAgent):
             try:
                 raw = self.model._query(self.model._prepare_messages_for_api(derived))
                 summary_text = raw.choices[0].message.content or ""
-            except Exception as e:  # network/auth/parse — fall through to wrapped path
-                self.logger.warning("summary _query failed (%s); falling back to query", e)
+            except Exception as e:
+                self.logger.warning("inline summary _query failed (%s); falling back to query", e)
                 summary_text, cost, timestamp = self._wrapped_summary_query(derived)
         else:
             summary_text, cost, timestamp = self._wrapped_summary_query(derived)
 
         self.cost += cost
-        return summary_text, {
+        summary_msg = self.model.format_message(
+            role="assistant", content=summary_text, extra={"source": "summary"})
+        info = {
             "cost": cost,
             "timestamp": timestamp,
+            "mode": "inline",
             "prompt_tokens": self._count_tokens(derived),
-            "completion_tokens": self._count_tokens(
-                [self.model.format_message(role="assistant", content=summary_text)]
-            ),
+            "completion_tokens": self._count_tokens([summary_msg]),
         }
+        return summary_text, info, [elicit, summary_msg]
 
     def _wrapped_summary_query(self, derived: list[dict]) -> tuple[str, float, Any]:
         """Summary call via the parsing ``query`` path, harvesting FormatError."""
