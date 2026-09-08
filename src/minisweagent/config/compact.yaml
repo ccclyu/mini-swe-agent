@@ -7,9 +7,15 @@
 # compaction knobs and the summary prompts are new.
 agent:
   agent_class: compacting
-  # Probe-calibrated (2026-08-25, Qwen3-4B on swesmith): 20k never fires
-  # (episodes peak at 5-9k tokens); 10k fires on ~38% of rollouts.
-  token_budget: 10000
+  # Calibrated on Qwen3.5-4B (2026-09-01, 100 swesmith episodes, cl100k count).
+  # Qwen3.5 thinks before acting, so episodes are ~3x larger than Qwen3-4B's:
+  # median episode 34k tokens, max 96k. Simulated on real uncompacted
+  # trajectories (validated: 10k predicted 4.30 compactions/ep vs 4.20 observed):
+  #    5k -> 16.7 compactions/ep (~75 of an 80-step budget spent summarising)
+  #   10k ->  4.30/ep, 96% of episodes fire, peak ctx 12.5k
+  #   20k ->  1.43/ep, 80% of episodes fire, peak ctx 22.4k   <- current
+  #   40k ->  0.38/ep, 36% of episodes fire
+  token_budget: 20000
   min_preserve_head: 2
   min_preserve_tail: 4
   min_compact_size: 6
@@ -148,3 +154,8 @@ model:
     {%- endif -%}
   model_kwargs:
     drop_params: true
+    # Hard cap per completion. The serving engine's default otherwise allows
+    # ~30k-token responses, which training-side row packing cannot afford at
+    # Qwen3.5's 248k vocab (logits explode in the log-prob pass). >16k turns
+    # were <1%% of observed traffic.
+    max_tokens: 16384

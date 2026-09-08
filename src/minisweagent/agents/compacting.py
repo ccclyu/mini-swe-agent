@@ -185,6 +185,10 @@ class CompactingAgent(DefaultAgent):
             summary_text, cost, timestamp = self._wrapped_summary_query(derived)
 
         self.cost += cost
+        # The recorded turn keeps the raw generation (training rows must match
+        # what the model emitted), but only the part after the reasoning goes
+        # into the <context_compacted> block: thinking models pre-open <think>
+        # via the generation prompt, so raw content starts with deliberation.
         summary_msg = self.model.format_message(
             role="assistant", content=summary_text, extra={"source": "summary"})
         info = {
@@ -194,7 +198,16 @@ class CompactingAgent(DefaultAgent):
             "prompt_tokens": self._count_tokens(derived),
             "completion_tokens": self._count_tokens([summary_msg]),
         }
-        return summary_text, info, [elicit, summary_msg]
+        return self._strip_reasoning(summary_text), info, [elicit, summary_msg]
+
+    def _strip_reasoning(self, text: str) -> str:
+        if "</think>" not in text:
+            return text.strip()
+        body = text.rsplit("</think>", 1)[1].strip()
+        if not body:
+            self.logger.warning("summary response was all reasoning (likely cut by max_tokens); keeping raw text")
+            return text.replace("<think>", "").replace("</think>", "").strip()
+        return body
 
     def _wrapped_summary_query(self, derived: list[dict]) -> tuple[str, float, Any]:
         """Summary call via the parsing ``query`` path, harvesting FormatError."""

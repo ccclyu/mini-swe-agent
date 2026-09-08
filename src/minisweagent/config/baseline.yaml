@@ -148,3 +148,8 @@ model:
     {%- endif -%}
   model_kwargs:
     drop_params: true
+    # Hard cap per completion. The serving engine's default otherwise allows
+    # ~30k-token responses, which training-side row packing cannot afford at
+    # Qwen3.5's 248k vocab (logits explode in the log-prob pass). >16k turns
+    # were <1%% of observed traffic.
+    max_tokens: 16384
