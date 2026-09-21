@@ -123,3 +123,41 @@ def test_yaml_config_is_valid():
         agent_cfg = yaml.safe_load(f)["agent"]
     agent_cfg.pop("agent_class", None)
     CompactingConfig(**agent_cfg)
+
+
+def _run_with_summaries(*summary_outputs, **config):
+    big = make_output("thinking", [{"command": f"echo '{'x' * 5000}'"}])
+    agent = CompactingAgent(
+        model=DeterministicModel(outputs=[big, big, *summary_outputs, _submit_output()]),
+        env=LocalEnvironment(),
+        **_minimal_config(token_budget=100, **config),
+    )
+    assert agent.run("do the thing")["exit_status"] == "Submitted"
+    assert len(agent.compactions) == 1, agent.compactions
+    return agent
+
+
+def test_cut_off_summary_is_retried_once():
+    cut = make_output("## Goal\nblah blah blah", [])
+    cut["extra"]["finish_reason"] = "length"
+    agent = _run_with_summaries(cut, make_output("## Goal\nGOOD_SUMMARY", []))
+    call = agent.compactions[0]["summary_call"]
+    assert (call["attempts"], call["fallback"]) == (2, False)
+    assert "GOOD_SUMMARY" in agent.messages[2]["content"] and "blah" not in agent.messages[2]["content"]
+    assert agent.compactions[0]["summary_exchange"][1]["content"] == "## Goal\nGOOD_SUMMARY"
+
+
+def test_unusable_summaries_fall_back_to_extractive_summary():
+    agent = _run_with_summaries(make_output("<think>still thinking", []), make_output("<think>hmm</think>", []))
+    call = agent.compactions[0]["summary_call"]
+    assert (call["attempts"], call["fallback"]) == (2, True)
+    injected = agent.messages[2]["content"]
+    assert "<think>" not in injected and "echo 'xxxx" in injected and "automatic extractive summary" in injected
+    assert agent.compactions[0]["summary_token_count"] <= _minimal_config()["summary_max_tokens"]
+
+
+def test_overlong_summary_body_is_kept_and_measured():
+    agent = _run_with_summaries(make_output("word " * 200, []), summary_max_tokens=20)
+    call = agent.compactions[0]["summary_call"]
+    assert call["body_tokens"] > 20 and call["fallback"] is False
+    assert agent.messages[2]["content"].count("word") == 200 and "truncated" not in agent.messages[2]["content"]

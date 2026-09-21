@@ -33,7 +33,7 @@ from jinja2 import StrictUndefined, Template
 
 from minisweagent import Environment, Model
 from minisweagent.agents.default import AgentConfig, DefaultAgent
-from minisweagent.agents.utils.context_utils import count_tokens, load_encoder
+from minisweagent.agents.utils.context_utils import count_tokens, load_encoder, message_text
 
 
 class CompactingConfig(AgentConfig):
@@ -59,6 +59,18 @@ class CompactingConfig(AgentConfig):
 
     # --- summary call ---------------------------------------------------
     summary_max_tokens: int = 2048
+    """Target length of the brief (prompted); longer bodies are injected unchanged but logged."""
+    summary_max_completion_tokens: int = 4096
+    """Hard ``max_tokens`` for the summary generation, reasoning included. 0 = model default."""
+    summary_max_attempts: int = 2
+    """Summary generations that are cut off, empty or all reasoning are retried this many times
+    in total; after that the extractive fallback below is injected instead."""
+    fallback_summary_template: str = (
+        "## Goal\nSee the task statement above.\n## Commands run in the compacted span\n{{ commands }}\n"
+        "## Last observation\n{{ last_observation }}\n## Next action\n"
+        "Re-inspect the current state of the files above before editing.\n"
+        "(automatic extractive summary: the model-written summary was unusable)"
+    )
     summary_inline_template: str = (
         "Your context is about to be compacted: every message between the task "
         "statement and the {{ min_preserve_tail }} most recent messages will be "
@@ -150,77 +162,116 @@ class CompactingAgent(DefaultAgent):
             lo, hi, replaced_tokens, self.compactions[-1]["summary_token_count"],
         )
 
-    def _run_summary_call_inline(self, slice_msgs: list[dict] | None = None) -> tuple[str, dict, list[dict]]:
+    def _run_summary_call_inline(self, slice_msgs: list[dict]) -> tuple[str, dict, list[dict]]:
         """Elicit the summary as an appended turn of the LIVE conversation.
 
         ``self.messages`` is never mutated with the elicitation: the prompt list
         is built ad hoc, so the agent loop never sees a parseless assistant
         turn and the FormatError-retry path cannot fire on the free-form
-        summary. The raw ``_query`` transport bypasses the action parser
-        (same trick as the derived path); at the HTTP layer the call is a
-        prefix-extension of the running segment, which is what makes the
-        trained row structure 1+N instead of 1+2N.
-        """
-        from minisweagent.models.utils.content_string import get_content_string
+        summary. The raw ``_query`` transport bypasses the action parser; at
+        the HTTP layer the call is a prefix-extension of the running segment,
+        which is what makes the trained row structure 1+N instead of 1+2N.
 
+        The generation is hard-capped at ``summary_max_completion_tokens``. A
+        response that was cut off, is empty, or never leaves its reasoning is
+        unusable as context and is retried; after ``summary_max_attempts`` the
+        extractive fallback is injected instead. The completion cap bounds the
+        injected body (worst case ~summary_max_completion_tokens of the budget);
+        its length is recorded as ``body_tokens`` for monitoring, not truncated,
+        because cutting a structured brief drops its "Next action" section.
+        """
         elicit = self.model.format_message(
             role="user",
             content=self._render_extra(self.config.summary_inline_template),
             extra={"source": "summary_elicitation"},
         )
         derived = self.messages + [elicit]
-        self.n_calls += 1
+        kwargs = {"max_tokens": self.config.summary_max_completion_tokens} if self.config.summary_max_completion_tokens else {}
 
-        summary_text = ""
-        cost = 0.0
-        timestamp = None
-        if hasattr(self.model, "_query"):
-            try:
-                raw = self.model._query(self.model._prepare_messages_for_api(derived))
-                summary_text = raw.choices[0].message.content or ""
-            except Exception as e:
-                self.logger.warning("inline summary _query failed (%s); falling back to query", e)
-                summary_text, cost, timestamp = self._wrapped_summary_query(derived)
-        else:
-            summary_text, cost, timestamp = self._wrapped_summary_query(derived)
-
+        cost, reason = 0.0, ""
+        for attempt in range(1, self.config.summary_max_attempts + 1):
+            self.n_calls += 1
+            summary_text, cost_i, timestamp, finish_reason = self._summary_query(derived, **kwargs)
+            cost += cost_i
+            body = self._strip_reasoning(summary_text)
+            reason = self._summary_failure(summary_text, body, finish_reason)
+            if not reason:
+                break
+            self.logger.warning("summary attempt %d unusable (%s)", attempt, reason)
         self.cost += cost
+
         # The recorded turn keeps the raw generation (training rows must match
-        # what the model emitted), but only the part after the reasoning goes
-        # into the <context_compacted> block: thinking models pre-open <think>
-        # via the generation prompt, so raw content starts with deliberation.
-        summary_msg = self.model.format_message(
-            role="assistant", content=summary_text, extra={"source": "summary"})
+        # what the model emitted); only the post-reasoning body goes into the
+        # <context_compacted> block.
+        summary_msg = self.model.format_message(role="assistant", content=summary_text, extra={"source": "summary"})
+        if reason:
+            body = self._extractive_summary(slice_msgs)
         info = {
             "cost": cost,
             "timestamp": timestamp,
             "mode": "inline",
+            "attempts": attempt,
+            "fallback": bool(reason),
+            "finish_reason": finish_reason,
             "prompt_tokens": self._count_tokens(derived),
             "completion_tokens": self._count_tokens([summary_msg]),
+            "body_tokens": self._count_tokens([{"role": "user", "content": body}]),
         }
-        return self._strip_reasoning(summary_text), info, [elicit, summary_msg]
+        if info["body_tokens"] > self.config.summary_max_tokens:
+            self.logger.warning("summary body %d tokens exceeds summary_max_tokens=%d", info["body_tokens"], self.config.summary_max_tokens)
+        return body, info, [elicit, summary_msg]
+
+    def _summary_query(self, derived: list[dict], **kwargs) -> tuple[str, float, Any, str | None]:
+        """One summary generation -> (text, cost, timestamp, finish_reason)."""
+        if hasattr(self.model, "_query"):
+            try:
+                raw = self.model._query(self.model._prepare_messages_for_api(derived), **kwargs)
+                return raw.choices[0].message.content or "", 0.0, None, raw.choices[0].finish_reason
+            except Exception as e:
+                self.logger.warning("inline summary _query failed (%s); falling back to query", e)
+        return self._wrapped_summary_query(derived, **kwargs)
+
+    @staticmethod
+    def _summary_failure(raw: str, body: str, finish_reason: str | None) -> str:
+        if finish_reason == "length":
+            return "cut off at max_tokens"
+        if not body:
+            return "empty"
+        if "<think>" in raw and "</think>" not in raw:
+            return "all reasoning"
+        return ""
 
     def _strip_reasoning(self, text: str) -> str:
-        if "</think>" not in text:
-            return text.strip()
-        body = text.rsplit("</think>", 1)[1].strip()
-        if not body:
-            self.logger.warning("summary response was all reasoning (likely cut by max_tokens); keeping raw text")
-            return text.replace("<think>", "").replace("</think>", "").strip()
-        return body
+        # Thinking models pre-open <think> via the generation prompt, so raw
+        # content may start with deliberation without an opening tag.
+        return text.rsplit("</think>", 1)[-1].strip()
 
-    def _wrapped_summary_query(self, derived: list[dict]) -> tuple[str, float, Any]:
+    def _extractive_summary(self, slice_msgs: list[dict]) -> str:
+        """Deterministic stand-in for an unusable model summary: commands run + last observation."""
+        commands: list[str] = []
+        for m in slice_msgs:
+            if m.get("role") != "assistant":
+                continue
+            for a in m.get("extra", {}).get("actions", []) or []:
+                c = " ".join(a.get("command", "").split())[:200]
+                if c and c not in commands:
+                    commands.append(c)
+        observations = [message_text(m) for m in slice_msgs if m.get("role") == "user"]
+        return self._render_extra(
+            self.config.fallback_summary_template,
+            commands="\n".join(f"- {c}" for c in commands[-25:]) or "- (none)",
+            last_observation=(observations[-1] if observations else "")[-1500:],
+        )
+
+    def _wrapped_summary_query(self, derived: list[dict], **kwargs) -> tuple[str, float, Any, str | None]:
         """Summary call via the parsing ``query`` path, harvesting FormatError."""
         from minisweagent.exceptions import FormatError
         from minisweagent.models.utils.content_string import get_content_string
 
         try:
-            response = self.model.query(derived)
-            return (
-                get_content_string(response) or "",
-                response.get("extra", {}).get("cost", 0.0),
-                response.get("extra", {}).get("timestamp"),
-            )
+            response = self.model.query(derived, **kwargs)
+            extra = response.get("extra", {})
+            return get_content_string(response) or "", extra.get("cost", 0.0), extra.get("timestamp"), extra.get("finish_reason")
         except FormatError as fe:
             # The summary response was free-form text; harvest it from the
             # FormatError's attached message instead of erroring.
@@ -228,8 +279,8 @@ class CompactingAgent(DefaultAgent):
             for msg in fe.messages:
                 c = get_content_string(msg) or ""
                 if c:
-                    return c, 0.0, None
-            return "", 0.0, None
+                    return c, 0.0, None, None
+            return "", 0.0, None, None
 
     def serialize(self, *extra_dicts) -> dict:
         data = super().serialize(*extra_dicts)

@@ -21,7 +21,15 @@ agent:
   min_compact_size: 6
   tokenizer_name: cl100k_base
 
+  # summary_max_tokens is the prompted target (bodies over it are logged, not cut).
+  # summary_max_completion_tokens is the max_tokens
+  # of the summary generation itself, reasoning included; previously the summary
+  # call inherited the 16k per-turn cap, and a cut-off or all-reasoning response
+  # was injected verbatim (up to 16k tokens of deliberation replacing the context,
+  # forcing the next compaction immediately — see training_logs 2026-09-15, 09-20).
   summary_max_tokens: 2048
+  summary_max_completion_tokens: 4096
+  summary_max_attempts: 2
   resumption_template: |
     <context_compacted n="{{ n_compactions }}" id="{{ compaction_id }}">
     {{ summary }}
