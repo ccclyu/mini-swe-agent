@@ -190,3 +190,16 @@ def test_summary_harvested_from_format_error_is_the_model_text():
     injected = agent.messages[2]["content"]
     assert "REAL_SUMMARY" in injected and "FORMAT_ERROR_PROMPT" not in injected
     assert agent.compactions[0]["summary_call"]["fallback"] is False
+
+
+def test_no_compaction_on_the_last_step():
+    big = make_output("thinking", [{"command": f"echo '{'x' * 5000}'"}])
+    agent = CompactingAgent(
+        model=DeterministicModel(outputs=[big, big, make_output("## Goal\nUNUSED", [])]),
+        env=LocalEnvironment(),
+        **_minimal_config(token_budget=100, step_limit=3),
+    )
+    # Over budget before call 3, but a summary would consume step 3 and the
+    # next query would hit the step limit: skip it, take the last action.
+    agent.run("do the thing")
+    assert agent.compactions == []

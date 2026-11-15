@@ -116,6 +116,10 @@ class CompactingAgent(DefaultAgent):
             return
         if self.config.max_compactions and len(self.compactions) >= self.config.max_compactions:
             return
+        # A summary call consumes a step; if it would use the last one, the
+        # next query raises LimitsExceeded and the summary is never used.
+        if 0 < self.config.step_limit <= self.n_calls + 1:
+            return
         lo = self.config.min_preserve_head
         hi = len(self.messages) - self.config.min_preserve_tail
         if hi - lo < self.config.min_compact_size:
