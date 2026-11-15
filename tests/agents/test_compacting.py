@@ -203,3 +203,9 @@ def test_no_compaction_on_the_last_step():
     # next query would hit the step limit: skip it, take the last action.
     agent.run("do the thing")
     assert agent.compactions == []
+
+
+def test_zero_summary_attempts_still_makes_one_attempt():
+    agent = _run_with_summaries(make_output("## Goal\nGOOD_SUMMARY", []), summary_max_attempts=0)
+    assert agent.compactions[0]["summary_call"]["attempts"] == 1
+    assert "GOOD_SUMMARY" in agent.messages[2]["content"]

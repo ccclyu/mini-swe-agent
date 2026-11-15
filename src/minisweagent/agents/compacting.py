@@ -64,7 +64,7 @@ class CompactingConfig(AgentConfig):
     """Hard ``max_tokens`` for the summary generation, reasoning included. 0 = model default."""
     summary_max_attempts: int = 2
     """Summary generations that are cut off, empty or all reasoning are retried this many times
-    in total; after that the extractive fallback below is injected instead."""
+    in total (at least 1); after that the extractive fallback below is injected instead."""
     fallback_summary_template: str = (
         "## Goal\nSee the task statement above.\n## Commands run in the compacted span\n{{ commands }}\n"
         "## Last observation\n{{ last_observation }}\n## Next action\n"
@@ -193,7 +193,7 @@ class CompactingAgent(DefaultAgent):
         kwargs = {"max_tokens": self.config.summary_max_completion_tokens} if self.config.summary_max_completion_tokens else {}
 
         cost, reason = 0.0, ""
-        for attempt in range(1, self.config.summary_max_attempts + 1):
+        for attempt in range(1, max(1, self.config.summary_max_attempts) + 1):
             self.n_calls += 1
             summary_text, cost_i, timestamp, finish_reason = self._summary_query(derived, **kwargs)
             cost += cost_i
