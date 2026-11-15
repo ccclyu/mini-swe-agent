@@ -273,13 +273,18 @@ class CompactingAgent(DefaultAgent):
             extra = response.get("extra", {})
             return get_content_string(response) or "", extra.get("cost", 0.0), extra.get("timestamp"), extra.get("finish_reason")
         except FormatError as fe:
-            # The summary response was free-form text; harvest it from the
-            # FormatError's attached message instead of erroring.
+            # The summary response was free-form text; harvest the model's own
+            # text from the FormatError. Its message content is the
+            # format-error *prompt* ("Expected exactly 1 action..."), never a
+            # summary; the generation lives in extra["model_response"].
             self.logger.info("summary response was free-form text; harvesting from FormatError")
             for msg in fe.messages:
-                c = get_content_string(msg) or ""
+                c = (msg.get("extra") or {}).get("model_response") or ""
                 if c:
                     return c, 0.0, None, None
+            # No model text attached (e.g. the tool-call parser): report empty
+            # so the attempt is retried / falls back instead of injecting the
+            # error prompt as the summary.
             return "", 0.0, None, None
 
     def serialize(self, *extra_dicts) -> dict:

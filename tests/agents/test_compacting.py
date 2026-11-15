@@ -7,6 +7,7 @@ import yaml
 from minisweagent.agents.compacting import CompactingAgent, CompactingConfig
 from minisweagent.environments.local import LocalEnvironment
 from minisweagent.models.test_models import DeterministicModel, make_output
+from minisweagent.models.utils.actions_text import parse_regex_actions
 
 
 def _minimal_config(**overrides) -> dict:
@@ -161,3 +162,31 @@ def test_overlong_summary_body_is_kept_and_measured():
     call = agent.compactions[0]["summary_call"]
     assert call["body_tokens"] > 20 and call["fallback"] is False
     assert agent.messages[2]["content"].count("word") == 200 and "truncated" not in agent.messages[2]["content"]
+
+
+class _ParsingSummaryModel(DeterministicModel):
+    """Raises the text-based parser's FormatError for outputs without actions,
+    as LitellmTextbasedModel.query does for a free-form summary turn."""
+
+    def query(self, messages, **kwargs):
+        output = super().query(messages, **kwargs)
+        if not output["extra"]["actions"]:
+            parse_regex_actions(
+                output["content"],
+                action_regex=r"```mswea_bash_command\s*\n(.*?)\n```",
+                format_error_template="FORMAT_ERROR_PROMPT: {{ error }}",
+            )
+        return output
+
+
+def test_summary_harvested_from_format_error_is_the_model_text():
+    big = make_output("thinking", [{"command": f"echo '{'x' * 5000}'"}])
+    agent = CompactingAgent(
+        model=_ParsingSummaryModel(outputs=[big, big, make_output("## Goal\nREAL_SUMMARY", []), _submit_output()]),
+        env=LocalEnvironment(),
+        **_minimal_config(token_budget=100),
+    )
+    assert agent.run("do the thing")["exit_status"] == "Submitted"
+    injected = agent.messages[2]["content"]
+    assert "REAL_SUMMARY" in injected and "FORMAT_ERROR_PROMPT" not in injected
+    assert agent.compactions[0]["summary_call"]["fallback"] is False
