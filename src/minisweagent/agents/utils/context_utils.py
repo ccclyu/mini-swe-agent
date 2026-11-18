@@ -36,3 +36,24 @@ def count_tokens(messages: list[dict], encoder=None) -> int:
     if encoder is not None:
         return len(encoder.encode(text, disallowed_special=()))
     return max(1, len(text) // 4)
+
+
+def context_text(msg: dict) -> str:
+    """Text of ``msg`` as a later prompt carries it when the chat template drops past reasoning.
+
+    A closed ``<think>`` block of an earlier assistant turn is not re-rendered
+    (e.g. Qwen3.5), so only the text after ``</think>`` remains. A turn that
+    never closed its block is rendered whole.
+    """
+    text = message_text(msg)
+    if msg.get("role") == "assistant" and "</think>" in text:
+        return text.rsplit("</think>", 1)[-1]
+    return text
+
+
+def count_context_tokens(messages: list[dict], encoder=None) -> int:
+    """Like ``count_tokens`` but over ``context_text``: what the model will actually be shown."""
+    text = "\n".join(context_text(m) for m in messages)
+    if encoder is not None:
+        return len(encoder.encode(text, disallowed_special=()))
+    return max(1, len(text) // 4)

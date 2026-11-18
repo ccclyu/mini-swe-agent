@@ -33,7 +33,7 @@ from jinja2 import StrictUndefined, Template
 
 from minisweagent import Environment, Model
 from minisweagent.agents.default import AgentConfig, DefaultAgent
-from minisweagent.agents.utils.context_utils import count_tokens, load_encoder, message_text
+from minisweagent.agents.utils.context_utils import count_context_tokens, count_tokens, load_encoder, message_text
 
 
 class CompactingConfig(AgentConfig):
@@ -44,6 +44,10 @@ class CompactingConfig(AgentConfig):
     """Compact every N steps. 0 disables."""
     tokenizer_name: str = "cl100k_base"
     """tiktoken encoding name. Falls back to char/4 if tiktoken is unavailable."""
+    count_reasoning_in_budget: bool = True
+    """Whether closed ``<think>`` blocks of past assistant turns count toward ``token_budget``.
+    Set False when the chat template drops past reasoning (Qwen3.5): the model no longer
+    sees that text, so counting it compacts a context that is smaller than the budget says."""
 
     # --- slice selection ----------------------------------------------
     min_preserve_head: int = 2
@@ -97,6 +101,12 @@ class CompactingAgent(DefaultAgent):
     def _count_tokens(self, messages: list[dict]) -> int:
         return count_tokens(messages, self._encoder)
 
+    def _budget_tokens(self, messages: list[dict]) -> int:
+        """Token count the budget trigger compares against ``token_budget``."""
+        if self.config.count_reasoning_in_budget:
+            return self._count_tokens(messages)
+        return count_context_tokens(messages, self._encoder)
+
     def _render_extra(self, template: str, **extra: Any) -> str:
         return Template(template, undefined=StrictUndefined).render(**self.get_template_vars(**extra))
 
@@ -108,7 +118,7 @@ class CompactingAgent(DefaultAgent):
         budget = self.config.token_budget
         step_budget = self.config.step_budget
         should_compact = False
-        if budget > 0 and self._count_tokens(self.messages) >= budget:
+        if budget > 0 and self._budget_tokens(self.messages) >= budget:
             should_compact = True
         elif step_budget > 0 and self.n_calls > 0 and self.n_calls % step_budget == 0:
             should_compact = True
@@ -134,6 +144,7 @@ class CompactingAgent(DefaultAgent):
 
         slice_msgs = list(self.messages[lo:hi])
         replaced_tokens = self._count_tokens(slice_msgs)
+        budget_tokens = self._budget_tokens(self.messages)
 
         summary, summary_call_info, summary_exchange = self._run_summary_call_inline(slice_msgs)
 
@@ -156,6 +167,7 @@ class CompactingAgent(DefaultAgent):
             "kind": "compact",
             "replaced_range": [lo, hi],
             "replaced_token_count": replaced_tokens,
+            "budget_token_count": budget_tokens,
             "summary_message_index": lo,
             "summary_call": summary_call_info,
             "summary_token_count": self._count_tokens([replacement_msg]),

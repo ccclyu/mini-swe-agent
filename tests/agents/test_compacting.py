@@ -209,3 +209,35 @@ def test_zero_summary_attempts_still_makes_one_attempt():
     agent = _run_with_summaries(make_output("## Goal\nGOOD_SUMMARY", []), summary_max_attempts=0)
     assert agent.compactions[0]["summary_call"]["attempts"] == 1
     assert "GOOD_SUMMARY" in agent.messages[2]["content"]
+
+
+def _reasoning_run(reasoning_suffix: str, **config):
+    """Two turns whose content is ~3000 tokens of reasoning + a short visible part, tiny observations."""
+    turn = make_output("word " * 3000 + reasoning_suffix + "THOUGHT: look", [{"command": "echo hi"}])
+    agent = CompactingAgent(
+        model=DeterministicModel(outputs=[turn, turn, make_output("## Goal\nSUMMARY", []), _submit_output()]),
+        env=LocalEnvironment(),
+        **_minimal_config(token_budget=1000, **config),
+    )
+    assert agent.run("do the thing")["exit_status"] == "Submitted"
+    return agent
+
+
+def test_closed_reasoning_counts_toward_the_budget_by_default():
+    agent = _reasoning_run("</think>\n\n")
+    assert len(agent.compactions) == 1
+
+
+def test_closed_reasoning_can_be_left_out_of_the_budget():
+    # The chat template drops past closed <think> blocks: the model's real context is a few
+    # hundred tokens, far under the 1000-token budget, so nothing should be compacted.
+    agent = _reasoning_run("</think>\n\n", count_reasoning_in_budget=False)
+    assert agent.compactions == []
+
+
+def test_unclosed_reasoning_always_counts():
+    # A turn that never closed its think block is rendered whole in later prompts.
+    agent = _reasoning_run("", count_reasoning_in_budget=False)
+    assert len(agent.compactions) == 1
+    c = agent.compactions[0]
+    assert c["budget_token_count"] >= 1000 and c["budget_token_count"] <= c["replaced_token_count"] + 2000

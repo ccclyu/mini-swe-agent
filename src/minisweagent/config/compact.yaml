@@ -16,6 +16,10 @@ agent:
   #   20k ->  1.43/ep, 80% of episodes fire, peak ctx 22.4k   <- current
   #   40k ->  0.38/ep, 36% of episodes fire
   token_budget: 20000
+  # Qwen3.5's chat template drops closed <think> blocks of past turns, so the budget counts
+  # only what later prompts carry. Counting them made 22% of the trigger invisible to the
+  # model by step 60 of the r2egym gate5 run (training_logs 2026-11-16).
+  count_reasoning_in_budget: false
   min_preserve_head: 2
   min_preserve_tail: 4
   min_compact_size: 6
